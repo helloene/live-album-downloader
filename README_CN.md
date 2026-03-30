@@ -5,7 +5,7 @@ PhotoPlus 是一个图片直播相册服务。
 Live Album Downloader 是一个用于下载 [PhotoPlus](https://live.photoplus.cn/) 活动照片的 Python 工具。
 它会通过公开接口获取照片列表，并将原图保存到 `./PhotoPlus/<activity_id>/`。
 
-English version: [README.md](./README.md)。
+English Version [README.md](./README.md)。
 
 ## 功能
 
@@ -32,7 +32,7 @@ English version: [README.md](./README.md)。
 
 ## 获取项目
 
-### Linux / macOS / Windows
+### 适用于 Linux / macOS / Windows
 
 #### git 克隆
 
@@ -57,7 +57,7 @@ curl -L -O https://raw.githubusercontent.com/helloene/live-album-downloader/main
 pip3 install requests tqdm
 ```
 
-#### 从 `main` 下载完整项目 ZIP
+#### 从 `main` 分支下载完整项目 ZIP
 
 ```bash
 wget https://github.com/helloene/live-album-downloader/archive/refs/heads/main.zip -O live-album-downloader.zip
@@ -65,7 +65,7 @@ unzip live-album-downloader.zip
 cd live-album-downloader-main
 ```
 
-#### 使用 curl 从 `main` 下载完整项目 ZIP
+#### 使用 curl 从 `main` 分支下载完整项目 ZIP
 
 ```bash
 curl -L https://github.com/helloene/live-album-downloader/archive/refs/heads/main.zip -o live-album-downloader.zip
@@ -73,7 +73,7 @@ unzip live-album-downloader.zip
 cd live-album-downloader-main
 ```
 
-#### 从 GitHub 下载 ZIP
+#### 从 GitHub 下载压缩包
 
 打开仓库页面，点击 `Code`，再选择 `Download ZIP`。
 
