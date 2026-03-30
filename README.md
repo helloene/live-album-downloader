@@ -5,7 +5,7 @@ PhotoPlus is a photo livestream album service.
 Live Album Downloader is a Python tool for downloading [PhotoPlus](https://live.photoplus.cn/) photo livestream albums.
 It fetches the album list from the public PhotoPlus endpoint and saves original images to `./PhotoPlus/<activity_id>/`.
 
-中文版请见 [README_CN.md](./README_CN.md)。
+[中文版](./README_CN.md)。
 
 ## Features
 
