@@ -29,6 +29,7 @@ Live Album Downloader 是一个用于下载 [PhotoPlus](https://live.photoplus.c
 - Python 3.10+
 - `requests`
 - `tqdm`
+- `piexif`
 
 ## 获取项目
 
@@ -54,7 +55,7 @@ curl -L -O https://raw.githubusercontent.com/helloene/live-album-downloader/main
 依赖包需要单独安装：
 
 ```bash
-pip3 install requests tqdm
+pip3 install requests tqdm piexif
 ```
 
 #### 从 `main` 分支下载完整项目 ZIP

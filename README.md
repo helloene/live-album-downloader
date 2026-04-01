@@ -29,6 +29,7 @@ It fetches the album list from the public PhotoPlus endpoint and saves original 
 - Python 3.10+
 - `requests`
 - `tqdm`
+- `piexif`
 
 ## Get the Project
 
@@ -54,7 +55,7 @@ curl -L -O https://raw.githubusercontent.com/helloene/live-album-downloader/main
 Install the required packages separately:
 
 ```bash
-pip3 install requests tqdm
+pip3 install requests tqdm piexif
 ```
 
 #### Download the full project ZIP from `main`
