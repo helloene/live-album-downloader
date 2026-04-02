@@ -8,10 +8,12 @@ import re
 import json
 import struct
 import html
+import stat
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from fractions import Fraction
 from string import Formatter
+from urllib.parse import urlparse
 from requests.exceptions import RequestException
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -87,8 +89,11 @@ def _build_iptc_caption_payload(caption_text):
     resource = bytearray()
     resource += PHOTOSHOP_RESOURCE_SIGNATURE
     resource += struct.pack('>H', PHOTOSHOP_IPTC_RESOURCE_ID)
-    resource += b'\x00'
-    if len(resource) % 2 != 0:
+    # Pascal string for resource name: length byte + string + pad to even
+    resource_name = b''
+    resource += bytes([len(resource_name)]) + resource_name
+    # Pad name field (length byte + name bytes) to even
+    if (1 + len(resource_name)) % 2 != 0:
         resource += b'\x00'
     resource += struct.pack('>I', len(iptc_payload))
     resource += iptc_payload
@@ -126,7 +131,8 @@ def _replace_or_insert_jpeg_segment(jpeg_bytes, new_payload, build_fn, match_fn)
         marker = jpeg_bytes[pos]
         pos += 1
 
-        if marker in (0xD8, 0xD9):
+        # Standalone markers: SOI, EOI, RST0-RST7 (no length field)
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
             result += b'\xFF' + bytes([marker])
             continue
 
@@ -223,13 +229,15 @@ def _write_optional_image_metadata(image_path, caption_text=None, gps=None):
         print(f"Skipping metadata write for non-JPEG file: {image_path}")
         return
 
+    original_mode = stat.S_IMODE(os.stat(image_path).st_mode)
+
     with open(image_path, 'rb') as f:
         jpeg_bytes = f.read()
 
     # Use piexif for EXIF + GPS metadata
     try:
         exif_dict = _normalize_exif_dict(piexif.load(jpeg_bytes))
-    except Exception:
+    except (piexif.InvalidImageDataError, struct.error, ValueError, KeyError):
         exif_dict = _empty_exif_dict()
 
     if caption_text:
@@ -256,6 +264,7 @@ def _write_optional_image_metadata(image_path, caption_text=None, gps=None):
     temp_path = f"{image_path}.meta.part"
     with open(temp_path, 'wb') as f:
         f.write(new_jpeg_bytes)
+    os.chmod(temp_path, original_mode)
     os.replace(temp_path, image_path)
 
 
@@ -265,7 +274,11 @@ def obj_key_sort(obj):
 
 
 def sanitize_filename(filename):
-    return re.sub(r'[<>:"/\\|?*]', '_', filename)
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    # Prevent path traversal via ".." components
+    parts = sanitized.replace('\\', '/').split('/')
+    parts = [p for p in parts if p not in ('', '.', '..')]
+    return '_'.join(parts) if parts else '_'
 
 
 def validate_rename_template(rename_template):
@@ -345,15 +358,27 @@ def _dedupe_download_name(filename, used_names):
     return candidate
 
 
+ALLOWED_DOWNLOAD_DOMAINS = {
+    "photoplus.cn",
+    "plusx.cn",
+}
+
+
 def _normalize_download_url(origin_img):
     origin_img = str(origin_img)
     if origin_img.startswith(("http://", "https://")):
-        return origin_img
-    if origin_img.startswith("//"):
-        return f"https:{origin_img}"
-    if origin_img.startswith("/"):
-        return f"https://live.photoplus.cn{origin_img}"
-    return f"https://{origin_img.lstrip('/')}"
+        url = origin_img
+    elif origin_img.startswith("//"):
+        url = f"https:{origin_img}"
+    elif origin_img.startswith("/"):
+        url = f"https://live.photoplus.cn{origin_img}"
+    else:
+        url = f"https://{origin_img.lstrip('/')}"
+    # Validate domain to avoid downloading from arbitrary hosts
+    host = urlparse(url).hostname or ""
+    if not any(host == d or host.endswith(f".{d}") for d in ALLOWED_DOWNLOAD_DOMAINS):
+        raise ValueError(f"Untrusted download domain: {host}")
+    return url
 
 
 def _first_value(item, keys):
@@ -368,9 +393,9 @@ def _parse_timestamp(value):
 
     if isinstance(value, (int, float)):
         if value > 1_000_000_000_000:
-            return datetime.fromtimestamp(value / 1000)
-        if value > 1_000_000_000:
-            return datetime.fromtimestamp(value)
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        if value > 100_000_000:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
         return None
 
     text = str(value).strip()
@@ -533,6 +558,10 @@ def download_image(url, output_dir, item=None, rename_template=None, set_mtime=T
     if filename is None:
         filename = build_download_name(url, item or {}, rename_template=rename_template, tab=tab)
     image_path = os.path.join(output_dir, filename)
+    # Prevent path traversal: ensure resolved path stays inside output_dir
+    if not os.path.realpath(image_path).startswith(os.path.realpath(output_dir) + os.sep):
+        print(f"Skipping unsafe filename: {filename}")
+        return
 
     def _post_process():
         _write_optional_image_metadata(image_path, caption_text=caption_text, gps=gps)
@@ -542,8 +571,10 @@ def download_image(url, output_dir, item=None, rename_template=None, set_mtime=T
             write_metadata_sidecar(image_path, item)
 
     if os.path.exists(image_path):
-        _post_process()
-        return
+        if os.path.getsize(image_path) > 0:
+            _post_process()
+            return
+        os.remove(image_path)
 
     for attempt in range(1, MAX_RETRIES + 1):
         temp_path = None
@@ -552,7 +583,9 @@ def download_image(url, output_dir, item=None, rename_template=None, set_mtime=T
                 response.raise_for_status()
                 with tempfile.NamedTemporaryFile(
                     mode='wb', delete=False, dir=output_dir,
-                    prefix=f".{os.path.basename(image_path)}.", suffix=".part",
+                    # Avoid dot-prefixed temp names: iCloud File Provider can
+                    # later propagate the hidden flag to the final renamed file.
+                    prefix=f"tmp.{os.path.basename(image_path)}.", suffix=".part",
                 ) as file:
                     temp_path = file.name
                     for chunk in response.iter_content(1024 * 64):
