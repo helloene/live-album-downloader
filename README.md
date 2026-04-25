@@ -88,6 +88,7 @@ pip3 install -r requirements.txt
 
 This repository also includes a portable Agent Skill at [`skills/photoplus-album-downloader`](./skills/photoplus-album-downloader/).
 It can be used by Codex, Claude, OpenClaw/OpenCode, and other agents that support local skill or tool instructions.
+It is also available on ClawHub: [helloene/photoplus-album-downloader](https://clawhub.ai/helloene/photoplus-album-downloader).
 
 The skill package includes:
 
