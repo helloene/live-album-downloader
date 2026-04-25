@@ -1,6 +1,15 @@
 ---
 name: photoplus-album-downloader
-description: Download PhotoPlus / 谱时图片直播 live album photos using helloene/live-album-downloader. Use when a user provides a PhotoPlus live album URL, mobile or PC live URL, or numeric activity ID and wants to archive/download original images, inspect album metadata, filter by date tab, save sidecar JSON metadata, or write caption/GPS metadata.
+description: Download PhotoPlus / 谱时图片直播 albums from a URL or activity ID; use to inspect metadata, filter date tabs, save JSON, or write caption/GPS metadata.
+version: 1.0.0
+dependencies: python>=3.10, requests, tqdm, piexif
+metadata:
+  openclaw:
+    requires:
+      bins:
+        - python3
+    skillKey: photoplus-album-downloader
+    homepage: https://github.com/helloene/live-album-downloader
 ---
 
 # PhotoPlus Album Downloader

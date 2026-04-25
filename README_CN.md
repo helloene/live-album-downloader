@@ -84,6 +84,28 @@ cd live-album-downloader-main
 pip3 install -r requirements.txt
 ```
 
+## Agent Skill
+
+本仓库也包含一个可移植的 Agent Skill：[`skills/photoplus-album-downloader`](./skills/photoplus-album-downloader/)。
+它可供 Codex、Claude、OpenClaw/OpenCode，以及其他支持本地 skill 或工具说明的 Agent 使用。
+
+Skill 包包含：
+
+- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md)：说明何时使用下载器，以及如何处理 PhotoPlus 图片直播链接或数字活动 ID
+- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py)：包装脚本，支持传入 PhotoPlus URL 或活动 ID，可按需准备上游项目并转发支持的参数
+- [`references/upstream-project.md`](./skills/photoplus-album-downloader/references/upstream-project.md)：上游 CLI、依赖和可用参数说明
+
+使用时，将 `skills/photoplus-album-downloader` 复制或软链接到对应 Agent 的本地 skills 目录，然后让 Agent 对 PhotoPlus 图片直播链接或活动 ID 使用 `photoplus-album-downloader`。
+
+包装脚本示例：
+
+```bash
+python3 skills/photoplus-album-downloader/scripts/download_photoplus_album.py \
+  "https://live.photoplus.cn/live/12345678" \
+  --workdir ./downloads \
+  --install-deps
+```
+
 ## 用法
 
 基础下载：

@@ -84,6 +84,28 @@ Open the repository page, choose `Code`, then select `Download ZIP`.
 pip3 install -r requirements.txt
 ```
 
+## Agent Skill
+
+This repository also includes a portable Agent Skill at [`skills/photoplus-album-downloader`](./skills/photoplus-album-downloader/).
+It can be used by Codex, Claude, OpenClaw/OpenCode, and other agents that support local skill or tool instructions.
+
+The skill package includes:
+
+- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md): when to use the downloader and how to handle PhotoPlus live URLs or numeric activity IDs
+- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py): a wrapper that accepts either a PhotoPlus URL or activity ID, prepares the upstream project when needed, and forwards supported options
+- [`references/upstream-project.md`](./skills/photoplus-album-downloader/references/upstream-project.md): notes about the upstream CLI, requirements, and supported flags
+
+To use it, copy or symlink `skills/photoplus-album-downloader` into your agent's local skills directory, then ask the agent to use `photoplus-album-downloader` for a PhotoPlus live album URL or activity ID.
+
+Example wrapper command:
+
+```bash
+python3 skills/photoplus-album-downloader/scripts/download_photoplus_album.py \
+  "https://live.photoplus.cn/live/12345678" \
+  --workdir ./downloads \
+  --install-deps
+```
+
 ## Usage
 
 Basic download:
