@@ -10,10 +10,13 @@ import struct
 import html
 import stat
 import tempfile
+import random
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from fractions import Fraction
 from string import Formatter
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from requests.exceptions import RequestException
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,9 +27,30 @@ SALT = 'laxiaoheiwu'
 COUNT = 9999
 MAX_RETRIES = 5
 REQUEST_TIMEOUT = 30
-OUTPUT_ROOT = "PhotoPlus"
 RENAME_TEMPLATE_FIELDS = {"name", "date", "time", "address", "tab"}
 PHOTO_NAME_KEYS = ("pic_name", "picName", "origin_name", "originName", "file_name", "fileName")
+PHOTOPLUS_SOURCE = "photoplus"
+PAILIXIANG_SOURCE = "pailixiang"
+ALLTUU_SOURCE = "alltuu"
+OUTPUT_ROOTS = {
+    PHOTOPLUS_SOURCE: "PhotoPlus",
+    PAILIXIANG_SOURCE: "Pailixiang",
+    ALLTUU_SOURCE: "Alltuu",
+}
+PAILIXIANG_API_BASE = "https://mapi.pailixiang.com/plx"
+PAILIXIANG_APP_KEY = "1e3a58fb24de413c9873542fc5667a25"
+
+# Alltuu / Piufoto (m.alltuu.com, www.piufoto.com) live album API.
+ALLTUU_API_HOST = "https://v4c.alltuu.com"
+ALLTUU_AUTH_HOST = "https://m.alltuu.com"
+ALLTUU_CDN_PRIVATE_KEY = "50f403a08b58841d319b92f0c10dbbd2"
+ALLTUU_SIGN_FROM = "100002"
+ALLTUU_PAGE_SIZE = 60
+ALLTUU_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+    "Referer": "https://m.alltuu.com/",
+}
 
 PHOTOSHOP_APP13_HEADER = b"Photoshop 3.0\x00"
 PHOTOSHOP_RESOURCE_SIGNATURE = b"8BIM"
@@ -52,7 +76,37 @@ def _decimal_to_dms(value):
     return ((degrees, 1), (minutes, 1), (sec_frac.numerator, sec_frac.denominator))
 
 
-def _build_gps_ifd(lat, lon, alt=None):
+def _parse_gps_time(value):
+    if not value:
+        return None
+    parts = str(value).strip().split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        hour = int(float(parts[0]))
+        minute = int(float(parts[1]))
+        second = Fraction(float(parts[2])).limit_denominator(1000000)
+    except (TypeError, ValueError):
+        return None
+    return ((hour, 1), (minute, 1), (second.numerator, second.denominator))
+
+
+def _gps_datetime_from_photo_datetime(dt):
+    if not dt:
+        return (None, None)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    utc_dt = dt.astimezone(timezone.utc)
+    gps_time = (
+        (utc_dt.hour, 1),
+        (utc_dt.minute, 1),
+        (utc_dt.second, 1),
+    )
+    gps_date = utc_dt.strftime("%Y:%m:%d")
+    return gps_time, gps_date
+
+
+def _build_gps_ifd(lat, lon, alt=None, gps_time=None, gps_date=None, speed=None, speed_ref=None, h_error=None):
     """Build a piexif GPS IFD dict from decimal WGS84 coordinates."""
     gps = {
         piexif.GPSIFD.GPSVersionID: (2, 3, 0, 0),
@@ -64,6 +118,16 @@ def _build_gps_ifd(lat, lon, alt=None):
     if alt is not None:
         gps[piexif.GPSIFD.GPSAltitudeRef] = 1 if alt < 0 else 0
         gps[piexif.GPSIFD.GPSAltitude] = _rational(abs(float(alt)))
+    parsed_time = gps_time if isinstance(gps_time, tuple) else _parse_gps_time(gps_time)
+    if parsed_time:
+        gps[piexif.GPSIFD.GPSTimeStamp] = parsed_time
+    if gps_date:
+        gps[piexif.GPSIFD.GPSDateStamp] = str(gps_date)
+    if speed is not None:
+        gps[piexif.GPSIFD.GPSSpeedRef] = str(speed_ref or "K")
+        gps[piexif.GPSIFD.GPSSpeed] = _rational(float(speed))
+    if h_error is not None:
+        gps[piexif.GPSIFD.GPSHPositioningError] = _rational(float(h_error))
     return gps
 
 
@@ -219,7 +283,251 @@ def _read_page_title(activity_id):
     return re.sub(r'\s*[-|·_]\s*PhotoPlus.*$', '', title, flags=re.IGNORECASE)
 
 
-def _write_optional_image_metadata(image_path, caption_text=None, gps=None):
+def _parse_album_reference(value, source="auto"):
+    text = str(value).strip()
+    parsed = urlparse(text)
+    host = parsed.hostname or ""
+
+    if source == "auto":
+        if host.endswith("alltuu.com") or host.endswith("piufoto.com"):
+            source = ALLTUU_SOURCE
+        elif host.endswith("pailixiang.com"):
+            source = PAILIXIANG_SOURCE
+        elif re.fullmatch(r"[0-9a-fA-F]{32}", text):
+            source = ALLTUU_SOURCE
+        elif re.fullmatch(r"a[A-Za-z0-9_-]+", text):
+            source = PAILIXIANG_SOURCE
+        else:
+            source = PHOTOPLUS_SOURCE
+
+    if source == ALLTUU_SOURCE:
+        match = re.search(r"/album/([0-9a-fA-F]{32})", parsed.path or text)
+        if match:
+            return source, match.group(1).lower()
+        match = re.fullmatch(r"[0-9a-fA-F]{32}", text)
+        if match:
+            return source, text.lower()
+        raise SystemExit(
+            "Wrong ID: use an Alltuu/Piufoto album URL/code such as a 32-character "
+            "album id copied from /album/<id>."
+        )
+
+    if source == PAILIXIANG_SOURCE:
+        match = re.search(r"/album/a?([A-Za-z0-9_-]+)", parsed.path or text)
+        if match:
+            return source, match.group(1)
+        match = re.fullmatch(r"a?([A-Za-z0-9_-]+)", text)
+        if match:
+            return source, match.group(1)
+        raise SystemExit(
+            "Wrong ID: use a Pailixiang album code copied from /album/a<code>."
+        )
+
+    match = re.search(r"/live/pc/([1-9]\d*)", text) or re.search(r"/live/([1-9]\d*)", text)
+    if match:
+        return source, match.group(1)
+    if re.fullmatch(r"[1-9]\d*", text):
+        return source, text
+    raise SystemExit(
+        "Wrong ID: use a valid numeric PhotoPlus activity ID copied from /live/<id> "
+        "or /live/pc/<id>/ in the URL."
+    )
+
+
+def _pailixiang_ak():
+    key = list(PAILIXIANG_APP_KEY)
+    prefix = ""
+    for _ in range(3):
+        number = random.randrange(10)
+        prefix += str(number)
+        key[number + 15] = key[number]
+    return prefix + "".join(key)
+
+
+def _pailixiang_payload(data, client_type=0, pid="albumview"):
+    payload = dict(data)
+    payload.update({
+        "tt": "",
+        "ct": client_type,
+        "cv": "151",
+        "lang": "cn",
+        "pid": pid,
+        "ak": _pailixiang_ak(),
+    })
+    return payload
+
+
+def _pailixiang_post(path, data, timeout=REQUEST_TIMEOUT):
+    response = requests.post(
+        f"{PAILIXIANG_API_BASE}{path}",
+        json=_pailixiang_payload(data),
+        timeout=timeout,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Origin": "https://live.pailixiang.com",
+            "Referer": "https://live.pailixiang.com/",
+            "Content-Type": "application/json;charset=utf-8",
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("Code") != 0:
+        raise SystemExit(f"Pailixiang API error {payload.get('Code')}: {payload.get('Msg')}")
+    return payload
+
+
+def _normalize_pailixiang_photo(item):
+    normalized = dict(item)
+    normalized["origin_img"] = (
+        item.get("DownloadImageUrl")
+        or item.get("BigImageUrl")
+        or item.get("ImageUrl")
+    )
+    normalized.setdefault("origin_name", item.get("Name") or item.get("FileName"))
+    normalized.setdefault("shoot_time", item.get("ShootTime"))
+    normalized.setdefault("photo_time", item.get("ShootTime"))
+    normalized.setdefault("activity_name", item.get("AlbumName"))
+    return normalized
+
+
+def _alltuu_cdn_signed_url(path, params):
+    """Build an Alltuu CDN-signed URL (md5 of privateKey + sorted path + hex time)."""
+    ts = format(int(time.time()), "x")
+    filename = path
+    for key in sorted(params):
+        filename += f"/{key}{params[key]}"
+    digest = hashlib.md5((ALLTUU_CDN_PRIVATE_KEY + filename + ts).encode()).hexdigest()
+    return f"{ALLTUU_API_HOST}/{digest}/{ts}{filename}"
+
+
+def _alltuu_server_signed_url(base, path, query):
+    """Build an Alltuu server-signed (E8) URL used by the authority endpoint."""
+    ts = str(int(time.time() * 1000))
+    sign = {"from": ALLTUU_SIGN_FROM, "version": "0", "token": "null", "timestamp": ts}
+    sign.update({key: str(value) for key, value in query.items()})
+    sign_str = "".join(f"/{sign[key]}" for key in sorted(sign))
+    digest = hashlib.md5(sign_str.encode()).hexdigest()
+    url = f"{base}{path}/v{ALLTUU_SIGN_FROM}-{ts}-null-0-{digest}"
+    if query:
+        url += "?" + urlencode(query)
+    return url
+
+
+def _alltuu_get(url, timeout=REQUEST_TIMEOUT):
+    response = requests.get(url, timeout=timeout, headers=ALLTUU_HEADERS)
+    response.raise_for_status()
+    return response.json()
+
+
+def _alltuu_secret(album_id, timeout=REQUEST_TIMEOUT):
+    url = _alltuu_server_signed_url(ALLTUU_AUTH_HOST, "/rest/fc/authority", {"albumId": album_id})
+    data = (_alltuu_get(url, timeout=timeout).get("data") or {})
+    secret = data.get("secret")
+    if not secret:
+        raise SystemExit(
+            "Wrong ID: use a valid Alltuu/Piufoto album URL/code such as "
+            "a 32-character album id copied from /album/<id>."
+        )
+    return secret
+
+
+def _alltuu_user_state(album_id, secret, timeout=REQUEST_TIMEOUT):
+    url = _alltuu_cdn_signed_url("/rest/v4o/us", {"a": album_id, "sk": secret})
+    url += "?t=" + str(5000 * (int(time.time() * 1000) // 5000))
+    return _alltuu_get(url, timeout=timeout).get("d") or {}
+
+
+def _alltuu_album_info(album_id, secret, version, timeout=REQUEST_TIMEOUT):
+    url = _alltuu_cdn_signed_url("/rest/v4c/fa", {"a": album_id, "sk": secret, "t": version})
+    return _alltuu_get(url, timeout=timeout).get("d") or {}
+
+
+def _alltuu_fetch_classify_photos(album_id, secret, classify, order, token, limit, timeout=REQUEST_TIMEOUT):
+    photos = []
+    pc = ""
+    while len(photos) < limit:
+        params = {
+            "a": album_id, "n": ALLTUU_PAGE_SIZE, "o": order, "pc": pc, "pd": "",
+            "s": classify, "sk": secret, "t": token, "v": "1",
+        }
+        page = _alltuu_get(_alltuu_cdn_signed_url("/rest/v4c/fplN", params), timeout=timeout).get("d") or []
+        if not page:
+            break
+        photos.extend(page)
+        next_pc = page[-1].get("pc")
+        if not next_pc or next_pc == pc:
+            break
+        pc = next_pc
+    return photos[:limit]
+
+
+def _normalize_alltuu_photo(item, album_title=None, address=None):
+    normalized = dict(item)
+    normalized["origin_img"] = item.get("ol") or item.get("bl") or item.get("url1920")
+    normalized.setdefault("origin_name", item.get("n"))
+    normalized.setdefault("photo_time", item.get("time"))
+    normalized.setdefault("width", item.get("w"))
+    normalized.setdefault("height", item.get("h"))
+    if album_title:
+        normalized.setdefault("activity_name", album_title)
+    if address:
+        normalized.setdefault("address", address)
+    return normalized
+
+
+def _encode_utf16le_null(text):
+    return str(text).encode("utf-16le") + b"\x00\x00"
+
+
+def _encode_utf8_bytes(text):
+    return str(text).encode("utf-8")
+
+
+def _first_text(item, keys):
+    value = _first_value(item or {}, keys)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def read_gps_from_reference_image(path):
+    if not shutil.which("exiftool"):
+        raise SystemExit("exiftool is required for --gps-from-image but was not found in PATH.")
+    try:
+        output = subprocess.check_output(
+            [
+                "exiftool", "-j", "-n",
+                "-GPSLatitude", "-GPSLongitude", "-GPSAltitude",
+                "-GPSSpeed", "-GPSSpeedRef", "-GPSHPositioningError",
+                str(path),
+            ],
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"Failed to read GPS metadata from {path}: {exc}") from exc
+
+    payload = json.loads(output)
+    item = payload[0] if payload else {}
+    if "GPSLatitude" not in item or "GPSLongitude" not in item:
+        raise SystemExit(f"No GPS latitude/longitude found in reference image: {path}")
+
+    gps = {
+        "lat": float(item["GPSLatitude"]),
+        "lon": float(item["GPSLongitude"]),
+    }
+    optional_map = {
+        "GPSAltitude": "alt",
+        "GPSSpeed": "speed",
+        "GPSSpeedRef": "speed_ref",
+        "GPSHPositioningError": "h_error",
+    }
+    for src_key, dst_key in optional_map.items():
+        if src_key in item and item[src_key] not in (None, ""):
+            gps[dst_key] = item[src_key]
+    return gps
+
+
+def _write_optional_image_metadata(image_path, item=None, caption_text=None, gps=None):
     """Update JPEG metadata in place while keeping the image bytes otherwise intact."""
     if not caption_text and gps is None:
         return
@@ -240,12 +548,56 @@ def _write_optional_image_metadata(image_path, caption_text=None, gps=None):
     except (piexif.InvalidImageDataError, struct.error, ValueError, KeyError):
         exif_dict = _empty_exif_dict()
 
+    item = item or {}
+    zeroth = exif_dict.setdefault("0th", {})
+    exif = exif_dict.setdefault("Exif", {})
+
     if caption_text:
         user_comment = b'UNICODE\x00' + caption_text.encode('utf-16-be') + b'\x00\x00'
-        exif_dict.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = user_comment
+        exif[piexif.ExifIFD.UserComment] = user_comment
+        zeroth[piexif.ImageIFD.ImageDescription] = _encode_utf8_bytes(caption_text)
+        zeroth[piexif.ImageIFD.XPTitle] = _encode_utf16le_null(caption_text)
+        zeroth[piexif.ImageIFD.XPComment] = _encode_utf16le_null(caption_text)
+
+    photo_name = _first_text(item, ("Name", "name", "origin_name", "FileName", "fileName", "pic_name", "picName"))
+    if photo_name:
+        zeroth[piexif.ImageIFD.DocumentName] = _encode_utf8_bytes(photo_name)
+        zeroth[piexif.ImageIFD.XPSubject] = _encode_utf16le_null(photo_name)
+
+    creator = _first_text(item, ("CreateUserName", "createUserName", "photographer", "author", "user_name", "userName"))
+    if creator:
+        zeroth[piexif.ImageIFD.Artist] = _encode_utf8_bytes(creator)
+        zeroth[piexif.ImageIFD.XPAuthor] = _encode_utf16le_null(creator)
+
+    dt = extract_photo_datetime(item)
+    if dt:
+        exif_time = dt.strftime("%Y:%m:%d %H:%M:%S")
+        zeroth[piexif.ImageIFD.DateTime] = exif_time
+        exif[piexif.ExifIFD.DateTimeOriginal] = exif_time
+        exif[piexif.ExifIFD.DateTimeDigitized] = exif_time
+
+    width = _first_value(item, ("Width", "width"))
+    height = _first_value(item, ("Height", "height"))
+    try:
+        if width:
+            exif[piexif.ExifIFD.PixelXDimension] = int(width)
+        if height:
+            exif[piexif.ExifIFD.PixelYDimension] = int(height)
+    except (TypeError, ValueError):
+        pass
+
+    photo_id = _first_text(item, ("ID", "id", "photo_id", "photoId"))
+    if photo_id:
+        exif[piexif.ExifIFD.ImageUniqueID] = photo_id
 
     if gps is not None:
-        exif_dict["GPS"] = _build_gps_ifd(gps['lat'], gps['lon'], gps.get('alt'))
+        gps_time, gps_date = _gps_datetime_from_photo_datetime(dt)
+        exif_dict["GPS"] = _build_gps_ifd(
+            gps['lat'], gps['lon'], gps.get('alt'),
+            gps_time=gps_time, gps_date=gps_date,
+            speed=gps.get('speed'), speed_ref=gps.get('speed_ref'),
+            h_error=gps.get('h_error'),
+        )
 
     exif_bytes = _dump_exif_bytes(exif_dict)
     output = io.BytesIO()
@@ -360,7 +712,10 @@ def _dedupe_download_name(filename, used_names):
 
 ALLOWED_DOWNLOAD_DOMAINS = {
     "photoplus.cn",
+    "pailixiang.com",
     "plusx.cn",
+    "alltuu.com",
+    "piufoto.com",
 }
 
 
@@ -549,10 +904,81 @@ def apply_file_timestamp(path, item):
     ts = dt.timestamp()
     os.utime(path, (ts, ts))
 
+def _json_safe_exif_value(value):
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8").rstrip("\x00")
+        except UnicodeDecodeError:
+            return value.hex()
+    if isinstance(value, tuple):
+        return [_json_safe_exif_value(v) for v in value]
+    if isinstance(value, list):
+        return [_json_safe_exif_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe_exif_value(v) for k, v in value.items()}
+    return value
+
+
+def _decode_exif_text_value(ifd_name, tag_name, value):
+    if tag_name in ("XPTitle", "XPComment", "XPAuthor", "XPKeywords", "XPSubject"):
+        raw = bytes(value) if isinstance(value, (tuple, list)) else value
+        if isinstance(raw, bytes):
+            return raw.decode("utf-16le", errors="replace").rstrip("\x00")
+
+    if tag_name == "UserComment" and isinstance(value, bytes):
+        if value.startswith(b"UNICODE\x00"):
+            return value[8:].decode("utf-16-be", errors="replace").rstrip("\x00")
+        if value.startswith(b"ASCII\x00\x00\x00"):
+            return value[8:].decode("ascii", errors="replace").rstrip("\x00")
+
+    return _json_safe_exif_value(value)
+
+
+def read_image_exif_metadata(image_path):
+    lower = image_path.lower()
+    if not lower.endswith(('.jpg', '.jpeg')):
+        return {"present": False, "reason": "not a JPEG file"}
+
+    try:
+        exif_dict = piexif.load(image_path)
+    except (piexif.InvalidImageDataError, struct.error, ValueError, KeyError) as exc:
+        return {"present": False, "reason": str(exc)}
+
+    ifds = {}
+    tag_count = 0
+    for ifd_name in ("0th", "Exif", "GPS", "Interop", "1st"):
+        values = exif_dict.get(ifd_name) or {}
+        if not values:
+            ifds[ifd_name] = {}
+            continue
+        readable = {}
+        for tag, value in values.items():
+            tag_info = piexif.TAGS.get(ifd_name, {}).get(tag, {})
+            tag_name = tag_info.get("name", str(tag))
+            readable[tag_name] = _decode_exif_text_value(ifd_name, tag_name, value)
+        ifds[ifd_name] = readable
+        tag_count += len(readable)
+
+    return {
+        "present": tag_count > 0,
+        "tag_count": tag_count,
+        "ifds": ifds,
+        "thumbnail_present": bool(exif_dict.get("thumbnail")),
+    }
+
+
 def write_metadata_sidecar(image_path, item):
     sidecar_path = f"{os.path.splitext(image_path)[0]}.json"
+    metadata = dict(item)
+    metadata["downloaded_file"] = {
+        "filename": os.path.basename(image_path),
+        "size": os.path.getsize(image_path) if os.path.exists(image_path) else None,
+        "mtime": datetime.fromtimestamp(os.path.getmtime(image_path)).isoformat()
+        if os.path.exists(image_path) else None,
+    }
+    metadata["exif"] = read_image_exif_metadata(image_path)
     with open(sidecar_path, "w", encoding="utf-8") as f:
-        json.dump(item, f, ensure_ascii=False, indent=2)
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 def download_image(url, output_dir, item=None, rename_template=None, set_mtime=True, save_metadata=False, tab=None, caption_text=None, gps=None, filename=None):
     if filename is None:
@@ -564,7 +990,7 @@ def download_image(url, output_dir, item=None, rename_template=None, set_mtime=T
         return
 
     def _post_process():
-        _write_optional_image_metadata(image_path, caption_text=caption_text, gps=gps)
+        _write_optional_image_metadata(image_path, item=item, caption_text=caption_text, gps=gps)
         if set_mtime and item:
             apply_file_timestamp(image_path, item)
         if save_metadata and item:
@@ -654,7 +1080,7 @@ def download_all_images(items, output_dir, tab=None, rename_template=None, set_m
             except Exception as exc:
                 print(f"Skipping failed download: {exc}")
 
-def fetch_activity_result(activity_id, count, timeout=REQUEST_TIMEOUT):
+def fetch_photoplus_activity_result(activity_id, count, timeout=REQUEST_TIMEOUT):
     t = int(time.time() * 1000)
     data = {
         "activityNo": activity_id,
@@ -681,20 +1107,151 @@ def fetch_activity_result(activity_id, count, timeout=REQUEST_TIMEOUT):
         )
     return result
 
-def get_all_images(activity_id, count, tab=None, rename_template=None, set_mtime=True, save_metadata=False, write_caption=False, gps=None, folder_name=None):
-    folder_name = sanitize_filename(str(folder_name or activity_id)).strip() or str(activity_id)
-    output_dir = os.path.join(".", OUTPUT_ROOT, folder_name)
-    result = fetch_activity_result(activity_id, count)
+
+def fetch_pailixiang_activity_result(album_code, count, timeout=REQUEST_TIMEOUT):
+    public_code = str(album_code).strip().lstrip("a")
+    view_payload = _pailixiang_post(
+        "/WapAbm/AlbumGetView",
+        {
+            "ID": public_code,
+            "AccessType": "1",
+            "SourceType": None,
+            "Nw": None,
+            "ClientType": 0,
+        },
+        timeout=timeout,
+    )
+    view_data = view_payload.get("Data") or {}
+    if view_data.get("ResCode", 0) > 0 or not view_data.get("Entity"):
+        raise SystemExit(
+            "Wrong ID: use a valid Pailixiang album URL/code such as "
+            "an album code copied from /album/a<code>."
+        )
+
+    entity = view_data["Entity"]
+    search_count = min(max(int(view_data.get("PhotoSearchCount") or 100), 1), 100)
+    remaining = count
+    start_index = 1
+    opt_time = ""
+    items = []
+    total = 0
+
+    while remaining > 0:
+        page_size = min(search_count, remaining)
+        search_payload = _pailixiang_post(
+            "/WapAbm/AlbumSearchPhoto",
+            {
+                "AlbumID": entity["ID"],
+                "GroupID": "",
+                "SearchType": 0,
+                "IsPayDownload": bool(entity.get("IsPayDownload")),
+                "PhotoSortType": entity.get("PhotoSortType", 0),
+                "IsNw": bool(view_data.get("IsNw")),
+                "IsEmbed": False,
+                "StartIndex": start_index,
+                "SearchCount": page_size,
+                "SortType": entity.get("SortType", 1),
+                "OptTime": opt_time,
+            },
+            timeout=timeout,
+        )
+        page_items = search_payload.get("Data") or []
+        if start_index == 1:
+            total = search_payload.get("TotalCount") or len(page_items)
+        if not page_items:
+            break
+        take = page_items[:remaining]
+        items.extend(_normalize_pailixiang_photo(item) for item in take)
+        start_index += len(page_items)
+        remaining -= len(take)
+        opt_time = search_payload.get("OptTime") or opt_time
+        if remaining <= 0 or len(page_items) < page_size:
+            break
+
+    title = entity.get("Title") or entity.get("Name") or f"a{public_code}"
+    for item in items:
+        if not item.get("activity_name"):
+            item["activity_name"] = title
+
+    return {
+        "pics_array": items,
+        "pics_total": total,
+        "activity_name": title,
+        "activity_code": entity.get("Code") or f"a{public_code}",
+    }
+
+
+def fetch_alltuu_activity_result(album_id, count, timeout=REQUEST_TIMEOUT):
+    secret = _alltuu_secret(album_id, timeout=timeout)
+    state = _alltuu_user_state(album_id, secret, timeout=timeout)
+    classify_versions = state.get("s") or {}
+
+    album_info = _alltuu_album_info(album_id, secret, state.get("fa"), timeout=timeout)
+    album_dto = album_info.get("albumDTO") or {}
+    title = album_dto.get("title") or album_id
+    address = album_dto.get("adrString")
+    default_order = album_dto.get("order", 0)
+
+    classifies = []
+    for sep in album_info.get("seperateDTOList") or []:
+        classify = str(sep.get("idEnc"))
+        version_info = classify_versions.get(classify)
+        if not version_info:
+            continue
+        classifies.append((classify, sep.get("sortType", default_order), version_info.get("v")))
+    if not classifies:
+        for classify, version_info in classify_versions.items():
+            if classify == "0":
+                continue
+            classifies.append((classify, default_order, version_info.get("v")))
+
+    total = sum(int(classify_versions.get(c, {}).get("t", 0)) for c, _, _ in classifies)
+
+    items = []
+    for classify, order, token in classifies:
+        remaining = count - len(items)
+        if remaining <= 0:
+            break
+        page = _alltuu_fetch_classify_photos(
+            album_id, secret, classify, order, token, remaining, timeout=timeout,
+        )
+        items.extend(_normalize_alltuu_photo(item, title, address) for item in page)
+
+    return {
+        "pics_array": items,
+        "pics_total": total or len(items),
+        "activity_name": title,
+        "activity_code": album_id,
+    }
+
+
+def fetch_activity_result(activity_id, count, source=PHOTOPLUS_SOURCE, timeout=REQUEST_TIMEOUT):
+    if source == PAILIXIANG_SOURCE:
+        return fetch_pailixiang_activity_result(activity_id, count, timeout=timeout)
+    if source == ALLTUU_SOURCE:
+        return fetch_alltuu_activity_result(activity_id, count, timeout=timeout)
+    return fetch_photoplus_activity_result(activity_id, count, timeout=timeout)
+
+
+def get_all_images(activity_id, count, tab=None, rename_template=None, set_mtime=True, save_metadata=False, write_caption=False, gps=None, folder_name=None, source=PHOTOPLUS_SOURCE):
+    default_folder_name = f"a{activity_id}" if source == PAILIXIANG_SOURCE and not str(activity_id).startswith("a") else activity_id
+    folder_name = sanitize_filename(str(folder_name or default_folder_name)).strip() or str(default_folder_name)
+    output_root = OUTPUT_ROOTS.get(source, "LiveAlbums")
+    output_dir = os.path.join(".", output_root, folder_name)
+    result = fetch_activity_result(activity_id, count, source=source)
 
     print(f"Total photos: {result['pics_total']}, download: {count}")
 
     os.makedirs(output_dir, exist_ok=True)
     caption_text = None
     if write_caption:
-        try:
-            caption_text = _read_page_title(activity_id)
-        except Exception as exc:
-            print(f"Failed to fetch activity title from page: {exc}")
+        if source == PHOTOPLUS_SOURCE:
+            try:
+                caption_text = _read_page_title(activity_id)
+            except Exception as exc:
+                print(f"Failed to fetch activity title from page: {exc}")
+        else:
+            caption_text = result.get("activity_name")
         if not caption_text and result.get('pics_array'):
             caption_text = result['pics_array'][0].get('activity_name')
         if caption_text:
@@ -708,8 +1265,8 @@ def get_all_images(activity_id, count, tab=None, rename_template=None, set_mtime
         save_metadata=save_metadata, caption_text=caption_text, gps=gps,
     )
 
-def inspect_activity(activity_id, count=20):
-    result = fetch_activity_result(activity_id, count=min(count, 20))
+def inspect_activity(activity_id, count=20, source=PHOTOPLUS_SOURCE):
+    result = fetch_activity_result(activity_id, count=min(count, 20), source=source)
     items = result.get('pics_array', [])
 
     print(f"Total photos: {result.get('pics_total')}, sample items: {len(items)}")
@@ -747,8 +1304,22 @@ def inspect_activity(activity_id, count=20):
         print(f"Preview addresses: {', '.join(unique_addresses[:5])}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download photos from PhotoPlus")
-    parser.add_argument("--id", type=int, help="PhotoPlus ID (e.g., 87654321)", required=True)
+    parser = argparse.ArgumentParser(description="Download photos from PhotoPlus, Pailixiang or Alltuu/Piufoto")
+    parser.add_argument(
+        "--id",
+        type=str,
+        help=(
+            "PhotoPlus numeric ID/URL, Pailixiang album code/URL, or "
+            "Alltuu/Piufoto album id/URL"
+        ),
+        required=True,
+    )
+    parser.add_argument(
+        "--source",
+        choices=("auto", PHOTOPLUS_SOURCE, PAILIXIANG_SOURCE, ALLTUU_SOURCE),
+        default="auto",
+        help="Album source; auto detects Pailixiang and Alltuu/Piufoto URLs and otherwise uses PhotoPlus",
+    )
     parser.add_argument("--count", type=int, default=COUNT, help="Number of photos to download")
     parser.add_argument(
         "--tab", type=str, default="all",
@@ -760,7 +1331,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--folder-name", type=str, default="",
-        help="Optional output folder name under PhotoPlus; defaults to the activity ID",
+        help="Optional output folder name under the source output root; defaults to the album ID",
     )
     parser.add_argument("--no-set-mtime", action="store_true", help="Do not set file modified time from photo metadata")
     parser.add_argument("--save-metadata", action="store_true", help="Write a JSON sidecar next to each image")
@@ -772,30 +1343,41 @@ if __name__ == "__main__":
     parser.add_argument("--gps-lat", type=float, help="Write GPS latitude into EXIF (WGS84)")
     parser.add_argument("--gps-lon", type=float, help="Write GPS longitude into EXIF (WGS84)")
     parser.add_argument("--gps-alt", type=float, help="Optional GPS altitude in meters")
+    parser.add_argument(
+        "--gps-from-image",
+        type=str,
+        help="Copy suitable GPS metadata from a reference image, excluding direction/bearing angles",
+    )
 
     args = parser.parse_args()
 
-    if args.id <= 0:
-        raise SystemExit("Wrong ID: use a positive numeric PhotoPlus activity ID.")
+    source, activity_id = _parse_album_reference(args.id, args.source)
     if args.tab and args.tab.lower() == "hot":
         raise SystemExit("Hot tab support has been removed in this version.")
 
     gps = None
-    if args.gps_lat is not None or args.gps_lon is not None or args.gps_alt is not None:
+    if args.gps_from_image:
+        gps = read_gps_from_reference_image(args.gps_from_image)
+    if args.gps_lat is not None or args.gps_lon is not None:
         if args.gps_lat is None or args.gps_lon is None:
             raise SystemExit("Both --gps-lat and --gps-lon are required when writing GPS metadata")
-        gps = {"lat": args.gps_lat, "lon": args.gps_lon}
-        if args.gps_alt is not None:
-            gps["alt"] = args.gps_alt
+        gps = dict(gps or {})
+        gps.update({"lat": args.gps_lat, "lon": args.gps_lon})
+    if args.gps_alt is not None:
+        if gps is None:
+            raise SystemExit("--gps-alt requires --gps-from-image or both --gps-lat and --gps-lon")
+        gps = dict(gps)
+        gps["alt"] = args.gps_alt
 
     if args.inspect:
-        inspect_activity(args.id, count=min(args.count, 20))
+        inspect_activity(activity_id, count=min(args.count, 20), source=source)
     else:
         rename_template = validate_rename_template(args.rename_template)
         get_all_images(
-            args.id, args.count,
+            activity_id, args.count,
             tab=args.tab, rename_template=rename_template,
             set_mtime=not args.no_set_mtime, save_metadata=args.save_metadata,
             write_caption=args.write_caption, gps=gps,
             folder_name=args.folder_name or None,
+            source=source,
         )

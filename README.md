@@ -1,15 +1,15 @@
 # Live Album Downloader
 
-PhotoPlus is a photo livestream album service.
+PhotoPlus, Pailixiang and Alltuu/Piufoto are photo livestream album services.
 
-Live Album Downloader is a Python tool for downloading [PhotoPlus](https://live.photoplus.cn/) photo livestream albums.
-It fetches the album list from the public PhotoPlus endpoint and saves original images to `./PhotoPlus/<activity_id>/`.
+Live Album Downloader is a Python tool for downloading [PhotoPlus](https://live.photoplus.cn/), [Pailixiang](https://live.pailixiang.com/) and [Alltuu/Piufoto](https://www.piufoto.com/) photo livestream albums.
+It fetches the album list from the public album endpoint and saves images under a source-specific folder such as `./PhotoPlus/<activity_id>/`, `./Pailixiang/<album_code>/` or `./Alltuu/<album_id>/`.
 
 [中文版](./README_CN.md)。
 
 ## Features
 
-- Download original photos from a PhotoPlus activity
+- Download photos from a PhotoPlus activity, Pailixiang album, or Alltuu/Piufoto album
 - Filter by tab:
   - `all`
   - date-like tabs such as `3.28` and `3.29`
@@ -30,6 +30,7 @@ It fetches the album list from the public PhotoPlus endpoint and saves original 
 - `requests`
 - `tqdm`
 - `piexif`
+- `exiftool` is optional and only needed for `--gps-from-image`
 
 ## Get the Project
 
@@ -88,14 +89,15 @@ pip3 install -r requirements.txt
 
 This repository also includes a portable Agent Skill at [`skills/photoplus-album-downloader`](./skills/photoplus-album-downloader/).
 It can be used by Codex, Claude, OpenClaw/OpenCode, and other agents that support local skill or tool instructions.
+It is also available on ClawHub: [helloene/photoplus-album-downloader](https://clawhub.ai/helloene/photoplus-album-downloader).
 
 The skill package includes:
 
-- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md): when to use the downloader and how to handle PhotoPlus live URLs or numeric activity IDs
-- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py): a wrapper that accepts either a PhotoPlus URL or activity ID, prepares the upstream project when needed, and forwards supported options
+- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md): when to use the downloader and how to handle PhotoPlus or Pailixiang album links
+- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py): a wrapper that accepts a PhotoPlus URL/ID or Pailixiang URL/code, prepares the upstream project when needed, and forwards supported options
 - [`references/upstream-project.md`](./skills/photoplus-album-downloader/references/upstream-project.md): notes about the upstream CLI, requirements, and supported flags
 
-To use it, copy or symlink `skills/photoplus-album-downloader` into your agent's local skills directory, then ask the agent to use `photoplus-album-downloader` for a PhotoPlus live album URL or activity ID.
+To use it, copy or symlink `skills/photoplus-album-downloader` into your agent's local skills directory, then ask the agent to use `photoplus-album-downloader` for a PhotoPlus or Pailixiang album URL/ID.
 
 Example wrapper command:
 
@@ -113,6 +115,14 @@ Basic download:
 ```bash
 # Linux / macOS
 python3 live_album_downloader.py --id 12345678
+```
+
+```bash
+# Pailixiang
+python3 live_album_downloader.py --id "a<album-code>"
+
+# Alltuu / Piufoto
+python3 live_album_downloader.py --id "<32-character-album-id>"
 ```
 
 ```powershell
@@ -196,20 +206,22 @@ python live_album_downloader.py --id 12345678 --save-metadata
 
 ## Command Line Options
 
-- `--id` Required. PhotoPlus activity ID.
+- `--id` Required. PhotoPlus activity ID/URL, Pailixiang album code/URL, or Alltuu/Piufoto album id/URL.
+- `--source` Album source: `auto`, `photoplus`, `pailixiang`, or `alltuu`. Default: `auto`.
 - `--count` Maximum number of photos to fetch. Default: `9999`.
 - `--tab` Filter photos by tab. Default: `all`.
 - `--rename-template` Optional filename template using `{name}`, `{date}`, `{time}`, `{address}`, and `{tab}`. The actual downloaded file extension is always preserved, and unsupported placeholders fail fast with a clear error. Default: keep the original downloaded filename.
-- `--folder-name` Optional output folder name under `PhotoPlus`. Default: activity ID.
+- `--folder-name` Optional output folder name under the source output root. Default: album ID.
 - `--no-set-mtime` Disable syncing file modification time from photo timestamp.
-- `--save-metadata` Save raw metadata to a JSON sidecar file. Default: disabled.
+- `--save-metadata` Save a JSON sidecar with the album item metadata, downloaded file details, and readable EXIF summary. Default: disabled.
 - `--inspect` Print a metadata summary and tab matching preview.
-- `--write-caption` Write the activity title into IPTC `Caption/Abstract` and EXIF `UserComment`. Default: disabled.
+- `--write-caption` Write the album title into IPTC `Caption/Abstract` and EXIF `UserComment`. Default: disabled.
 - `--gps-lat` GPS latitude.
 - `--gps-lon` GPS longitude.
 - `--gps-alt` Optional GPS altitude in meters. Default: unset.
+- `--gps-from-image` Copy suitable GPS metadata from a reference image. Requires `exiftool`; explicit `--gps-lat`, `--gps-lon`, and `--gps-alt` override copied coordinates/altitude.
 
-## How to Find the Activity ID
+## How to Find the Album ID
 
 Open the PhotoPlus live page and copy the numeric activity ID from the URL.
 Both mobile links like `/live/12345678` and PC links like `/live/pc/12345678/#/live` use the same ID.
@@ -219,11 +231,15 @@ https://live.photoplus.cn/live/12345678
 https://live.photoplus.cn/live/pc/12345678/#/live
 ```
 
+For Pailixiang, copy the album code from `/album/a<code>`.
+
+For Alltuu/Piufoto, copy the 32-character album id from `/album/<id>`.
+
 If you see `Wrong ID`, the usual causes are:
 
-- the ID is not the number in `/live/<id>` or `/live/pc/<id>`
+- the ID is not the number in `/live/<id>` or `/live/pc/<id>`, or not the code in `/album/a<code>`
 - the ID is `0` or a negative number
-- the activity is unavailable, private, expired, or no longer returns data from the PhotoPlus API
+- the album is unavailable, private, expired, or no longer returns data from the source API
 
 ## Metadata Behavior
 
@@ -231,9 +247,10 @@ If you see `Wrong ID`, the usual causes are:
 - By default it keeps the original downloaded filename when possible.
 - If two photos resolve to the same output filename, later files are renamed with numeric suffixes such as `_2` to avoid overwriting earlier downloads.
 - It does not rewrite image metadata unless `--write-caption` or GPS arguments are provided.
-- When enabled, the PhotoPlus page title is written into IPTC `Caption/Abstract` and EXIF `UserComment`.
+- When enabled, the album title is written into IPTC `Caption/Abstract` and EXIF `UserComment`.
 - Apple Photos/iOS Photos caption support primarily relies on IPTC `Caption/Abstract`.
 - GPS metadata is written in standard EXIF GPS format and should use WGS84 coordinates.
+- `--gps-from-image` copies latitude, longitude, altitude, speed, speed reference, and horizontal positioning error when available; it does not copy direction or bearing angles.
 
 ## Output
 
@@ -241,12 +258,16 @@ Downloads are saved under:
 
 ```text
 ./PhotoPlus/<activity_id>/
+./Pailixiang/<album_code>/
+./Alltuu/<album_id>/
 ```
 
 If `--folder-name` is provided, the output path becomes:
 
 ```text
 ./PhotoPlus/<folder_name>/
+./Pailixiang/<folder_name>/
+./Alltuu/<folder_name>/
 ```
 
 ## Notes

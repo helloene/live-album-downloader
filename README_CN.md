@@ -1,15 +1,15 @@
 # Live Album Downloader
 
-PhotoPlus 是一个图片直播相册服务。
+PhotoPlus、拍立享和 Alltuu/Piufoto 是图片直播相册服务。
 
-Live Album Downloader 是一个用于下载 [PhotoPlus](https://live.photoplus.cn/) 活动照片的 Python 工具。
-它会通过公开接口获取照片列表，并将原图保存到 `./PhotoPlus/<activity_id>/`。
+Live Album Downloader 是一个用于下载 [PhotoPlus](https://live.photoplus.cn/)、[拍立享](https://live.pailixiang.com/) 和 [Alltuu/Piufoto](https://www.piufoto.com/) 活动照片的 Python 工具。
+它会通过公开相册接口获取照片列表，并按来源保存到 `./PhotoPlus/<activity_id>/`、`./Pailixiang/<album_code>/` 或 `./Alltuu/<album_id>/` 这类目录。
 
 [English version](./README.md)。
 
 ## 功能
 
-- 下载 PhotoPlus 活动原图
+- 下载 PhotoPlus 活动、拍立享相册或 Alltuu/Piufoto 相册图片
 - 支持按 Tab 过滤：
   - `all`
   - `3.28`、`3.29` 这类日期 Tab
@@ -30,6 +30,7 @@ Live Album Downloader 是一个用于下载 [PhotoPlus](https://live.photoplus.c
 - `requests`
 - `tqdm`
 - `piexif`
+- `exiftool` 为可选依赖，仅在使用 `--gps-from-image` 时需要
 
 ## 获取项目
 
@@ -88,14 +89,15 @@ pip3 install -r requirements.txt
 
 本仓库也包含一个可移植的 Agent Skill：[`skills/photoplus-album-downloader`](./skills/photoplus-album-downloader/)。
 它可供 Codex、Claude、OpenClaw/OpenCode，以及其他支持本地 skill 或工具说明的 Agent 使用。
+也可以在 ClawHub 获取：[helloene/photoplus-album-downloader](https://clawhub.ai/helloene/photoplus-album-downloader)。
 
 Skill 包包含：
 
-- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md)：说明何时使用下载器，以及如何处理 PhotoPlus 图片直播链接或数字活动 ID
-- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py)：包装脚本，支持传入 PhotoPlus URL 或活动 ID，可按需准备上游项目并转发支持的参数
+- [`SKILL.md`](./skills/photoplus-album-downloader/SKILL.md)：说明何时使用下载器，以及如何处理 PhotoPlus 或拍立享相册链接
+- [`scripts/download_photoplus_album.py`](./skills/photoplus-album-downloader/scripts/download_photoplus_album.py)：包装脚本，支持传入 PhotoPlus URL/ID 或拍立享 URL/代码，可按需准备上游项目并转发支持的参数
 - [`references/upstream-project.md`](./skills/photoplus-album-downloader/references/upstream-project.md)：上游 CLI、依赖和可用参数说明
 
-使用时，将 `skills/photoplus-album-downloader` 复制或软链接到对应 Agent 的本地 skills 目录，然后让 Agent 对 PhotoPlus 图片直播链接或活动 ID 使用 `photoplus-album-downloader`。
+使用时，将 `skills/photoplus-album-downloader` 复制或软链接到对应 Agent 的本地 skills 目录，然后让 Agent 对 PhotoPlus 或拍立享相册 URL/ID 使用 `photoplus-album-downloader`。
 
 包装脚本示例：
 
@@ -113,6 +115,14 @@ python3 skills/photoplus-album-downloader/scripts/download_photoplus_album.py \
 ```bash
 # Linux / macOS
 python3 live_album_downloader.py --id 12345678
+```
+
+```bash
+# 拍立享
+python3 live_album_downloader.py --id "a<album-code>"
+
+# Alltuu / Piufoto
+python3 live_album_downloader.py --id "<32-character-album-id>"
 ```
 
 ```powershell
@@ -196,20 +206,22 @@ python live_album_downloader.py --id 12345678 --save-metadata
 
 ## 命令行参数
 
-- `--id` 必填，PhotoPlus 活动 ID。
+- `--id` 必填，PhotoPlus 活动 ID/URL、拍立享相册代码/URL，或 Alltuu/Piufoto 相册 ID/URL。
+- `--source` 相册来源：`auto`、`photoplus`、`pailixiang` 或 `alltuu`。默认 `auto`。
 - `--count` 最大拉取数量，默认 `9999`。
 - `--tab` 按 Tab 过滤，默认 `all`。
 - `--rename-template` 可选文件名模板，可使用 `{name}`、`{date}`、`{time}`、`{address}`、`{tab}`。会始终保留实际下载文件的原始扩展名；如果占位符不受支持，会直接给出清晰报错。默认保留下载后的原始文件名。
-- `--folder-name` 可选输出文件夹名称，位于 `PhotoPlus` 目录下，默认使用活动 ID。
+- `--folder-name` 可选输出文件夹名称，位于来源对应的输出根目录下，默认使用相册 ID。
 - `--no-set-mtime` 不再将文件修改时间对齐到拍摄时间。
-- `--save-metadata` 保存原始 JSON 元数据，默认关闭。
+- `--save-metadata` 保存 JSON 旁路文件，包含相册条目元数据、下载文件信息和可读 EXIF 摘要，默认关闭。
 - `--inspect` 打印元数据摘要和 Tab 匹配结果。
-- `--write-caption` 将活动标题写入 IPTC `Caption/Abstract` 和 EXIF `UserComment`，默认关闭。
+- `--write-caption` 将相册标题写入 IPTC `Caption/Abstract` 和 EXIF `UserComment`，默认关闭。
 - `--gps-lat` GPS 纬度。
 - `--gps-lon` GPS 经度。
 - `--gps-alt` 可选海拔，单位米，默认不写入。
+- `--gps-from-image` 从参考图片复制合适的 GPS 元数据。需要 `exiftool`；显式传入的 `--gps-lat`、`--gps-lon` 和 `--gps-alt` 会覆盖复制得到的坐标/海拔。
 
-## 如何找到活动 ID
+## 如何找到相册 ID
 
 打开 PhotoPlus 活动页面，复制地址栏中的数字活动 ID。
 手机链接如 `/live/12345678` 和 PC 链接如 `/live/pc/12345678/#/live` 使用的是同一个 ID。
@@ -219,11 +231,15 @@ https://live.photoplus.cn/live/12345678
 https://live.photoplus.cn/live/pc/12345678/#/live
 ```
 
+拍立享链接可直接复制 `/album/a<code>` 中的相册代码。
+
+Alltuu/Piufoto 链接可直接复制 `/album/<id>` 中 32 位的相册 ID。
+
 如果看到 `Wrong ID`，通常是以下原因：
 
-- 填写的不是 `/live/<id>` 或 `/live/pc/<id>` 里的那串数字
+- 填写的不是 `/live/<id>` 或 `/live/pc/<id>` 里的那串数字，或不是 `/album/a<code>` 里的相册代码
 - ID 为 `0` 或负数
-- 活动已失效、私有、过期，或 PhotoPlus API 已不再返回该活动数据
+- 相册已失效、私有、过期，或来源接口已不再返回该相册数据
 
 ## 元数据行为
 
@@ -231,9 +247,10 @@ https://live.photoplus.cn/live/pc/12345678/#/live
 - 默认尽量保留下载后的原始文件名
 - 如果两张照片生成了相同的输出文件名，后面的文件会自动追加 `_2` 这类数字后缀，避免覆盖前面的下载结果
 - 只有启用 `--write-caption` 或 GPS 参数时才改写图片元数据
-- 启用 `--write-caption` 后，会把 PhotoPlus 页面标题写入 IPTC `Caption/Abstract`，并兼容写入 EXIF `UserComment`
+- 启用 `--write-caption` 后，会把相册标题写入 IPTC `Caption/Abstract`，并兼容写入 EXIF `UserComment`
 - Apple/iOS 相册的 Caption 主要依赖 IPTC `Caption/Abstract`
 - GPS 使用标准 EXIF GPS 格式，建议输入 WGS84 坐标
+- `--gps-from-image` 会在可用时复制纬度、经度、海拔、速度、速度参考和水平定位误差；不会复制方向或方位角
 
 ## 输出目录
 
@@ -241,12 +258,16 @@ https://live.photoplus.cn/live/pc/12345678/#/live
 
 ```text
 ./PhotoPlus/<activity_id>/
+./Pailixiang/<album_code>/
+./Alltuu/<album_id>/
 ```
 
 如果传入 `--folder-name`，则输出目录变为：
 
 ```text
 ./PhotoPlus/<folder_name>/
+./Pailixiang/<folder_name>/
+./Alltuu/<folder_name>/
 ```
 
 ## 说明

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Wrapper for helloene/live-album-downloader.
 
-Accepts a PhotoPlus live URL or numeric activity ID, prepares the upstream
-project if needed, and forwards supported CLI flags.
+Accepts a PhotoPlus live URL/numeric activity ID or a Pailixiang album URL/code,
+prepares the upstream project if needed, and forwards supported CLI flags.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 REPO_URL = "https://github.com/helloene/live-album-downloader.git"
@@ -24,27 +25,41 @@ RAW_SCRIPT_URL = (
 DEFAULT_REPO_DIR = Path(".codex") / "live-album-downloader"
 
 
-def parse_activity_id(value: str) -> str:
+def parse_album_reference(value: str) -> tuple[str, str | None]:
     value = value.strip()
-    if re.fullmatch(r"[1-9]\d*", value):
-        return value
+    host = urlparse(value).hostname or ""
 
-    patterns = [
-        r"/live/pc/([1-9]\d*)",
-        r"/live/([1-9]\d*)",
-    ]
-    for pattern in patterns:
+    inferred_source = None
+    if host.endswith("pailixiang.com"):
+        inferred_source = "pailixiang"
+    elif host.endswith("photoplus.cn"):
+        inferred_source = "photoplus"
+
+    if re.fullmatch(r"[1-9]\d*", value):
+        return value, inferred_source
+    if re.fullmatch(r"a?[A-Za-z0-9_-]+", value):
+        source = inferred_source
+        if source is None and value.startswith("a"):
+            source = "pailixiang"
+        return value, source
+
+    patterns = (
+        (r"/live/pc/([1-9]\d*)", "photoplus"),
+        (r"/live/([1-9]\d*)", "photoplus"),
+        (r"/album/(a?[A-Za-z0-9_-]+)", "pailixiang"),
+    )
+    for pattern, source in patterns:
         match = re.search(pattern, value)
         if match:
-            return match.group(1)
+            return match.group(1), inferred_source or source
 
     numbers = re.findall(r"[1-9]\d{4,}", value)
     if len(numbers) == 1:
-        return numbers[0]
+        return numbers[0], inferred_source
 
     raise SystemExit(
-        "Could not find a PhotoPlus activity ID. Expected a numeric ID or a "
-        "URL like https://live.photoplus.cn/live/12345678"
+        "Could not find an album ID. Expected a PhotoPlus numeric ID/URL or a "
+        "Pailixiang album code copied from /album/a<code>"
     )
 
 
@@ -82,8 +97,10 @@ def install_dependencies(repo_dir: Path) -> None:
 
 def build_args(args: argparse.Namespace, activity_id: str, script: Path) -> list[str]:
     cmd = [sys.executable, str(script), "--id", activity_id]
+    source = args.source or args.inferred_source
 
     forward_values = [
+        ("--source", source),
         ("--count", args.count),
         ("--tab", args.tab),
         ("--rename-template", args.rename_template),
@@ -91,6 +108,7 @@ def build_args(args: argparse.Namespace, activity_id: str, script: Path) -> list
         ("--gps-lat", args.gps_lat),
         ("--gps-lon", args.gps_lon),
         ("--gps-alt", args.gps_alt),
+        ("--gps-from-image", args.gps_from_image),
     ]
     for flag, value in forward_values:
         if value is not None:
@@ -110,14 +128,14 @@ def build_args(args: argparse.Namespace, activity_id: str, script: Path) -> list
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download a PhotoPlus live album via helloene/live-album-downloader."
+        description="Download a PhotoPlus or Pailixiang live album via helloene/live-album-downloader."
     )
-    parser.add_argument("album", help="PhotoPlus live URL or numeric activity ID")
+    parser.add_argument("album", help="PhotoPlus live URL/ID or Pailixiang album URL/code")
     parser.add_argument(
         "--workdir",
         type=Path,
         default=Path.cwd(),
-        help="Directory where ./PhotoPlus output will be created.",
+        help="Directory where ./PhotoPlus or ./Pailixiang output will be created.",
     )
     parser.add_argument(
         "--repo-dir",
@@ -136,6 +154,7 @@ def main() -> int:
         help="Print the resolved command without cloning, installing, or downloading.",
     )
     parser.add_argument("--count")
+    parser.add_argument("--source", choices=("auto", "photoplus", "pailixiang"))
     parser.add_argument("--tab")
     parser.add_argument("--rename-template")
     parser.add_argument("--folder-name")
@@ -146,13 +165,16 @@ def main() -> int:
     parser.add_argument("--gps-lat")
     parser.add_argument("--gps-lon")
     parser.add_argument("--gps-alt")
+    parser.add_argument("--gps-from-image")
 
     args = parser.parse_args()
-    activity_id = parse_activity_id(args.album)
+    activity_id, args.inferred_source = parse_album_reference(args.album)
 
     if args.dry_run:
         fake_script = args.repo_dir / "live_album_downloader.py"
         print("activity_id=" + activity_id)
+        if args.inferred_source:
+            print("inferred_source=" + args.inferred_source)
         print("workdir=" + str(args.workdir))
         print("command=" + " ".join(build_args(args, activity_id, fake_script)))
         return 0
